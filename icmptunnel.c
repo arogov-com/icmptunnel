@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <net/if.h>
 #include <linux/if_tun.h>
@@ -22,12 +23,16 @@
 #include <netinet/ip_icmp.h>
 #include <netinet/ip.h>
 #include <netdb.h>
+#include <zlib.h>
 
-#define CLIENT 1
-#define SERVER 2
-#define CLIENTS_TABLE_SIZE 256
-#define DIRECTION_SEND 0
-#define DIRECTION_RECV 1
+#define CLIENT              1
+#define SERVER              2
+#define CLIENTS_TABLE_SIZE  256
+#define DIRECTION_SEND      0
+#define DIRECTION_RECV      1
+#define ZLIB_SIGNATURE      0xda78
+#define BUFFER_SIZE         1500
+#define ZBUFFER_SIZE        1500
 
 typedef struct {
     uint8_t   iph_ihl:4;       // Internet Header Length (IHL). The number of 32-bit words in the header. The minimum value for this field is 5.
@@ -89,6 +94,8 @@ typedef struct {
     in_addr_t client_virt;
     uint16_t  seq;
     uint16_t  id;
+    uint8_t   uses_zlib;
+    time_t    last_activity;
 }client_node_t;
 
 struct counters {
@@ -320,36 +327,38 @@ void usage(char *progname) {
     fprintf(stderr, "  -s: run in server mode\n");
     fprintf(stderr, "  -c <server ip>: run in client mode\n");
     fprintf(stderr, "  -a <tun ip>: assign address to the tun interface\n");
+    fprintf(stderr, "  -z: compress packets with zlib\n");
     fprintf(stderr, "  -d: show debug messages. You can increace debug level of running app by sending signal SIGUSR2\n");
     fprintf(stderr, "Statistic is available by sending SIGUSR1\n");
 }
 
 int main(int argc, char **argv) {
-    char buffer[1492 + sizeof(icmp_echo_t)];
+    char *buffer = NULL;
+    char *zbuffer = NULL;
     int opt;
     int mode = 0;
     char iface[IFNAMSIZ] = "\0";
     char tundev[IFNAMSIZ] = "\0";
     char tunaddr[16] = "\0";
     in_addr_t tunaddrn;
+    int zlib = 0;
 
     int pid;
     char server_ipa[16];
     in_addr_t server_ipn;
     client_node_t *clients;
 
-    int raw_sock_icmp;
+    int raw_sock_icmp = 0;
     int tun_fd = 0;
 
     uint16_t sequence = 1;
     extern char *optarg;
-    while((opt = getopt(argc, argv, "i:sc:d::a:h")) > 0) {
+    while((opt = getopt(argc, argv, "i:sc:d::a:zh")) > 0) {
         switch(opt) {
             case 's':
                 if(mode == CLIENT) {
                     usage(argv[0]);
                     return 1;
-                    break;
                 }
                 mode = SERVER;
                 break;
@@ -357,7 +366,6 @@ int main(int argc, char **argv) {
                 if(mode == SERVER) {
                     usage(argv[0]);
                     return 1;
-                    break;
                 }
                 mode = CLIENT;
                 struct hostent *h = gethostbyname(optarg);
@@ -387,13 +395,15 @@ int main(int argc, char **argv) {
                     debug += optarg[0] == 'd' ? 1 : 0;
                 }
                 break;
+            case 'z':
+                zlib = 1;
+                break;
             case 'h':
                 usage(argv[0]);
                 return 0;
             default:
                 usage(argv[0]);
                 return 1;
-                break;
         }
     }
     if(mode == 0) {
@@ -426,56 +436,57 @@ int main(int argc, char **argv) {
     }
     memset(clients, 0, sizeof(client_node_t) * CLIENTS_TABLE_SIZE);
 
+    buffer = malloc(BUFFER_SIZE);
+    if(buffer == NULL) {
+        fprintf(stderr, "error: could not allocate %i bytes of memory\n", BUFFER_SIZE);
+        goto buffer_alloc_error;
+    }
+
+    zbuffer = malloc(ZBUFFER_SIZE);
+    if(zbuffer == NULL) {
+        fprintf(stderr, "error: could not allocate %i bytes of memory\n", BUFFER_SIZE);
+        goto zbuffer_alloc_error;
+    }
+
     printf("Create raw icmp socket\n");
     raw_sock_icmp = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if(raw_sock_icmp < 0) {
         fprintf(stderr, "error: could not create raw ICMP socket\n");
-        free(clients);
-        return 1;
+        goto raw_sock_error;
     }
 
     printf("Bind icmp raw socket to %s\n", iface);
     if(setsockopt(raw_sock_icmp, SOL_SOCKET, SO_BINDTODEVICE, iface, strlen(iface)) < 0) {
         fprintf(stderr, "error: could not bind the socket to the device\n");
-        close(raw_sock_icmp);
-        free(clients);
-        return 1;
+        goto raw_sock_error;
     }
 
     printf("Create %s TUN device\n", tundev);
     tun_fd = tun_alloc(tundev, IFF_TUN);
     if(tun_fd < 0) {
         fprintf(stderr, "error: could not allocate tun device\n");
-        close(raw_sock_icmp);
-        free(clients);
-        return 1;
+        goto tun_fd_error;
     }
 
     printf("Assign address %s to %s\n", tunaddr, tundev);
     sprintf(buffer, "ip address add %s/24 dev %s", tunaddr, tundev);
     if(system(buffer)) {
         fprintf(stderr, "error: could not assign address %s to the interface %s\n", tunaddr, tundev);
-        close(raw_sock_icmp);
-        free(clients);
-        return 1;
+        goto release_all;
     }
 
     printf("Set link %s up\n", tundev);
     sprintf(buffer, "ip link set dev %s up", tundev);
     if(system(buffer)) {
         fprintf(stderr, "error: could not set link %s up\n", tundev);
-        close(raw_sock_icmp);
-        free(clients);
-        return 1;
+        goto release_all;
     }
 
     printf("Set MTU to 1472\n");
     sprintf(buffer, "ip l set mtu 1472 dev %s", tundev);
     if(system(buffer)) {
         fprintf(stderr, "error: could not set mtu for link %s\n", tundev);
-        close(raw_sock_icmp);
-        free(clients);
-        return 1;
+        goto release_all;
     }
 
     if(mode == CLIENT) {
@@ -483,8 +494,7 @@ int main(int argc, char **argv) {
         sprintf(buffer, "ip route add default via %s", tunaddr);
         if(system(buffer)) {
             fprintf(stderr, "error: could not add default route via %s\n", tunaddr);
-            close(raw_sock_icmp);
-            free(clients);
+            goto release_all;
             return 1;
         }
     }
@@ -511,38 +521,55 @@ int main(int argc, char **argv) {
             // Packet from the TUN interface
             if(FD_ISSET(tun_fd, &rd_set)) {
                 // Read a packet into the buffer with offset for an ICMP header
-                int nread = read(tun_fd, buffer + sizeof(icmp_echo_t), sizeof(buffer) - sizeof(icmp_echo_t));
+                int nread = read(tun_fd, buffer + sizeof(icmp_echo_t), BUFFER_SIZE - sizeof(icmp_echo_t));
 
-                ip_header_t *in_ip = (ip_header_t *)(buffer + sizeof(icmp_echo_t));
                 icmp_echo_t *out_icmp = (icmp_echo_t *)buffer;
+                ip_header_t *in_ip = (ip_header_t *)&out_icmp->data;
+                char *out_buffer = buffer;
+
+                // If client uses zlib or server knows that client uses zlib compress packet
+                if((zlib && mode == CLIENT) || (mode == SERVER && clients[in_ip->iph_dest >> 24].uses_zlib)) {
+                    uLongf zbuff_len = ZBUFFER_SIZE - sizeof(icmp_echo_t);
+                    if(compress2((Bytef *)(zbuffer + sizeof(icmp_echo_t)), &zbuff_len, (Bytef *)in_ip, nread, Z_BEST_COMPRESSION) != Z_OK) {
+                        struct timeval te;
+                        gettimeofday(&te, NULL);
+                        struct tm tm = *localtime(&te.tv_sec);
+                        fprintf(stderr, "%i: %02i:%02i:%02i.%06lu could not compress packet\n", __LINE__, tm.tm_hour, tm.tm_min, tm.tm_sec, te.tv_usec);
+                        continue;
+                    }
+                    out_icmp = (icmp_echo_t *)zbuffer;
+                    out_buffer = zbuffer;
+                    nread = zbuff_len;
+                }
+
+                out_icmp->code = 0;
+                out_icmp->crc = 0;
 
                 // Check packet, encapsulate, send to the server
                 if(mode == CLIENT) {
                     // Cut out multicast and stray packets
-                    if(0xe0 == (in_ip->iph_dest & 0xf0) || in_ip->iph_src != tunaddrn) {
+                    if((in_ip->iph_dest & 0xf0) == 0xe0 || in_ip->iph_src != tunaddrn) {
                         continue;
                     }
 
                     // Encapsulate packet into ICMP and send it to the server
                     if(in_ip->iph_protocol == IPPROTO_UDP || in_ip->iph_protocol == IPPROTO_TCP || in_ip->iph_protocol == IPPROTO_ICMP ) {
                         // Make outer ICMP echo header
-                        out_icmp->code = 0;
                         out_icmp->type = ICMP_ECHO;
                         out_icmp->id = ntohs(pid);
                         out_icmp->seq = ntohs(sequence++);
-                        out_icmp->crc = 0;
-                        out_icmp->crc = checksum(buffer, htons(in_ip->iph_length) + sizeof(icmp_echo_t), 0);
+                        out_icmp->crc = checksum(out_buffer, nread + sizeof(icmp_echo_t), 0);
 
                         struct sockaddr_in dst;
                         dst.sin_family = AF_INET;
                         dst.sin_port = 0;
                         dst.sin_addr.s_addr = server_ipn;
 
-                        update_counters(in_ip->iph_protocol, DIRECTION_SEND, nread);
+                        update_counters(in_ip->iph_protocol, DIRECTION_SEND, nread + sizeof(icmp_echo_t));
                         debud_log(__LINE__, 2, in_ip, nread, tundev, server_ipn, pid, sequence);
 
                         // Send encapsulated packet to the server
-                        int ret = sendto(raw_sock_icmp, buffer, nread + sizeof(icmp_echo_t), 0, (const struct sockaddr *)&dst, sizeof(dst));
+                        int ret = sendto(raw_sock_icmp, out_buffer, nread + sizeof(icmp_echo_t), 0, (const struct sockaddr *)&dst, sizeof(dst));
                         if(ret < 0) {
                             perror("client sendto error\n");
                         }
@@ -552,38 +579,54 @@ int main(int argc, char **argv) {
                 else if(mode == SERVER) {
                     // Check if packet has a record in the clients table
                     if(clients[in_ip->iph_dest >> 24].client_ip) {
-                        out_icmp->code = 0;
                         out_icmp->type = ICMP_ECHOREPLY;
                         out_icmp->id = clients[in_ip->iph_dest >> 24].id;
                         out_icmp->seq = clients[in_ip->iph_dest >> 24].seq;
-                        out_icmp->crc = 0;
-                        out_icmp->crc = checksum(buffer, htons(in_ip->iph_length) + sizeof(icmp_echo_t), 0);
+                        out_icmp->crc = checksum(out_buffer, nread + sizeof(icmp_echo_t), 0);
 
                         struct sockaddr_in dst;
                         dst.sin_family = AF_INET;
                         dst.sin_port = 0;
                         dst.sin_addr.s_addr = clients[in_ip->iph_dest >> 24].client_ip;
 
-                        update_counters(in_ip->iph_protocol, DIRECTION_SEND, nread);
+                        update_counters(in_ip->iph_protocol, DIRECTION_SEND, nread + sizeof(icmp_echo_t));
                         debud_log(__LINE__, 3, in_ip, nread, tundev, dst.sin_addr.s_addr, 0, 0);
 
-                        int ret = sendto(raw_sock_icmp, buffer, nread + sizeof(icmp_echo_t), 0, (const struct sockaddr *)&dst, sizeof(dst));
+                        int ret = sendto(raw_sock_icmp, out_buffer, nread + sizeof(icmp_echo_t), 0, (const struct sockaddr *)&dst, sizeof(dst));
                         if(ret < 0) {
                             perror("server sendto error\n");
                         }
-
                     }
                 }
+
             }
             // ICMP packet from Internet
             if(FD_ISSET(raw_sock_icmp, &rd_set)) {
-                int nread = recvfrom(raw_sock_icmp, buffer, sizeof(buffer), 0, NULL, NULL);
+                int nread = recvfrom(raw_sock_icmp, buffer, BUFFER_SIZE, 0, NULL, NULL);
 
                 ip_header_t *outer_ip = (ip_header_t *)buffer;
 
                 if(outer_ip->iph_protocol == IPPROTO_ICMP) {
                     icmp_echo_t *outer_icmp = (icmp_echo_t *)((void *)outer_ip + (outer_ip->iph_ihl << 2));
-                    ip_header_t *inner_ip = (void *)outer_icmp + sizeof(icmp_echo_t);
+                    ip_header_t *inner_ip = (ip_header_t *)&outer_icmp->data;
+                    char *out_buff = (char *)inner_ip;
+                    uint8_t uses_zlib = 0;
+
+                    // Check if ICMP echo data field starts with zlib signature
+                    if(*(uint16_t *)outer_icmp->data == ZLIB_SIGNATURE) {
+                        uLongf zbuff_len = ZBUFFER_SIZE;
+                        uLongf buff_len = nread - (outer_ip->iph_ihl << 2) - sizeof(icmp_echo_t);
+                        if(uncompress2((Bytef *)zbuffer, &zbuff_len, (Bytef *)&outer_icmp->data, &buff_len) != Z_OK) {
+                            struct timeval te;
+                            gettimeofday(&te, NULL);
+                            struct tm tm = *localtime(&te.tv_sec);
+                            fprintf(stderr, "%i: %02i:%02i:%02i.%06lu could not uncompress packet\n", __LINE__, tm.tm_hour, tm.tm_min, tm.tm_sec, te.tv_usec);
+                            continue;
+                        }
+                        out_buff = zbuffer;
+                        inner_ip = (ip_header_t *)zbuffer;
+                        uses_zlib = 1;
+                    }
 
                     // Receive ICMP echo request on the server side, decapsulate, send via tun interface
                     if(outer_icmp->type == ICMP_ECHO && mode == SERVER) {
@@ -592,11 +635,14 @@ int main(int argc, char **argv) {
                             clients[inner_ip->iph_src >> 24].client_ip = outer_ip->iph_src;
                             clients[inner_ip->iph_src >> 24].seq = outer_icmp->seq;
                             clients[inner_ip->iph_src >> 24].id = outer_icmp->id;
+                            clients[inner_ip->iph_src >> 24].client_virt = inner_ip->iph_src;
+                            clients[inner_ip->iph_src >> 24].uses_zlib = uses_zlib;
+                            clients[inner_ip->iph_src >> 24].last_activity = time(NULL);
 
                             update_counters(inner_ip->iph_protocol, DIRECTION_RECV, nread - (outer_ip->iph_ihl << 2));
                             debud_log(__LINE__, 1, inner_ip, nread, "raw_sock_icmp", 0, 0, 0);
 
-                            write(tun_fd, buffer + (outer_ip->iph_ihl << 2) + sizeof(icmp_echo_t), nread - (outer_ip->iph_ihl << 2) - sizeof(icmp_echo_t));
+                            write(tun_fd, out_buff, nread - (outer_ip->iph_ihl << 2) - sizeof(icmp_echo_t));
                         }
                     }
                     // Receive ICMP echo reply on the client side, decapsulate, write to tun interface
@@ -605,12 +651,24 @@ int main(int argc, char **argv) {
                             update_counters(inner_ip->iph_protocol, DIRECTION_RECV, nread - (outer_ip->iph_ihl << 2));
                             debud_log(__LINE__, 1, inner_ip, nread, "raw_sock_icmp", 0, 0, 0);
 
-                            write(tun_fd, buffer + (outer_ip->iph_ihl << 2) + sizeof(icmp_echo_t), nread - (outer_ip->iph_ihl << 2) - sizeof(icmp_echo_t));
+                            write(tun_fd, out_buff, nread - (outer_ip->iph_ihl << 2) - sizeof(icmp_echo_t));
                         }
                     }
                 }
             }
         }
     }
-    return 0;
+
+    release_all:
+        close(tun_fd);
+    tun_fd_error:
+        close(raw_sock_icmp);
+    raw_sock_error:
+        free(zbuffer);
+    zbuffer_alloc_error:
+        free(buffer);
+    buffer_alloc_error:
+        free(clients);
+
+    return 1;
 }

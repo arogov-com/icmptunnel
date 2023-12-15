@@ -3,6 +3,7 @@ SOURCE = icmptunnel.c
 
 CC = gcc
 CFLAGS = -Wall
+LDFLAGS = -lz
 
 SERVER = example.com
 DEPLOY_PATH = /home/alex/$(PROJECT)
@@ -10,7 +11,7 @@ DEPLOY_PATH = /home/alex/$(PROJECT)
 default: $(PROJECT)
 
 $(PROJECT): $(SOURCE)
-	$(CC) $(CFLAGS) $< -o $@
+	$(CC) $(CFLAGS) $(LDFLAGS) $< -o $@
 
 clean:
 	rm $(PROJECT)
@@ -25,4 +26,4 @@ c: $(PROJECT)
 
 # Run server
 s: $(PROJECT)
-	./$(PROJECT) -sd -i eth0 -a 10.20.30.1
+	sudo ./$(PROJECT) -sd -i eth0 -a 10.20.30.1

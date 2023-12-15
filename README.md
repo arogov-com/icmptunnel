@@ -9,6 +9,7 @@ make
 -c <server ip> - run as client
 -i - outside interface
 -a <tun ip> - assign address to tunnel interface
+-z - compress packets with zlib
 -d - enable debug prints. May be specified twice for full packet printing</code>
 
 ### Handled signals
