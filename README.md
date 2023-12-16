@@ -10,6 +10,7 @@ make
 -i - outside interface
 -a <tun ip> - assign address to tunnel interface
 -z - compress packets with zlib
+-r - enable ping reply
 -d - enable debug prints. May be specified twice for full packet printing</code>
 
 ### Handled signals

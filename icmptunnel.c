@@ -328,6 +328,7 @@ void usage(char *progname) {
     fprintf(stderr, "  -c <server ip>: run in client mode\n");
     fprintf(stderr, "  -a <tun ip>: assign address to the tun interface\n");
     fprintf(stderr, "  -z: compress packets with zlib\n");
+    fprintf(stderr, "  -r: enable ping reply\n");
     fprintf(stderr, "  -d: show debug messages. You can increace debug level of running app by sending signal SIGUSR2\n");
     fprintf(stderr, "Statistic is available by sending SIGUSR1\n");
 }
@@ -342,6 +343,7 @@ int main(int argc, char **argv) {
     char tunaddr[16] = "\0";
     in_addr_t tunaddrn;
     int zlib = 0;
+    int reply = 0;
 
     int pid;
     char server_ipa[16];
@@ -353,7 +355,7 @@ int main(int argc, char **argv) {
 
     uint16_t sequence = 1;
     extern char *optarg;
-    while((opt = getopt(argc, argv, "i:sc:d::a:zh")) > 0) {
+    while((opt = getopt(argc, argv, "i:sc:d::a:zrh")) > 0) {
         switch(opt) {
             case 's':
                 if(mode == CLIENT) {
@@ -397,6 +399,9 @@ int main(int argc, char **argv) {
                 break;
             case 'z':
                 zlib = 1;
+                break;
+            case 'r':
+                reply = 1;
                 break;
             case 'h':
                 usage(argv[0]);
@@ -644,9 +649,24 @@ int main(int argc, char **argv) {
 
                             write(tun_fd, out_buff, nread - (outer_ip->iph_ihl << 2) - sizeof(icmp_echo_t));
                         }
+                        else if(reply == 1) {
+                            struct sockaddr_in dst;
+                            dst.sin_family = AF_INET;
+                            dst.sin_port = 0;
+                            dst.sin_addr.s_addr = outer_ip->iph_src;
+
+                            outer_icmp->type = ICMP_ECHOREPLY;
+                            outer_icmp->crc = 0;
+                            outer_icmp->crc = checksum((char *)outer_icmp, nread - (outer_ip->iph_ihl << 2), 0);
+
+                            int ret = sendto(raw_sock_icmp, (char *)outer_icmp, nread - (outer_ip->iph_ihl << 2), 0, (const struct sockaddr *)&dst, sizeof(dst));
+                            if(ret < 0) {
+                                perror("server ping reply sendto error\n");
+                            }
+                        }
                     }
                     // Receive ICMP echo reply on the client side, decapsulate, write to tun interface
-                    if(outer_icmp->type == ICMP_ECHOREPLY && mode == CLIENT) {
+                    else if(outer_icmp->type == ICMP_ECHOREPLY && mode == CLIENT) {
                         if(inner_ip->iph_version == 4 && (inner_ip->iph_protocol == IPPROTO_ICMP || inner_ip->iph_protocol == IPPROTO_UDP || inner_ip->iph_protocol == IPPROTO_TCP)) {
                             update_counters(inner_ip->iph_protocol, DIRECTION_RECV, nread - (outer_ip->iph_ihl << 2));
                             debud_log(__LINE__, 1, inner_ip, nread, "raw_sock_icmp", 0, 0, 0);

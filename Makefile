@@ -26,4 +26,4 @@ c: $(PROJECT)
 
 # Run server
 s: $(PROJECT)
-	sudo ./$(PROJECT) -sd -i eth0 -a 10.20.30.1
+	sudo ./$(PROJECT) -sd -r -i eth0 -a 10.20.30.1
