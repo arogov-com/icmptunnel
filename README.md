@@ -37,3 +37,8 @@ Run server
 
 ### Run client
 `sudo ./icmptunnel -c <server ip> -i eth0 -a 10.20.30.2`
+
+### Local test
+The script will create 3 namespaces (client, gateway, server) and transfer traffic between the client's and server's namespaces
+
+`make test`

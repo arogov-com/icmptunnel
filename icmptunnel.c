@@ -26,8 +26,8 @@
 #define DIRECTION_SEND      0
 #define DIRECTION_RECV      1
 #define ZLIB_SIGNATURE      0xda78
-#define BUFFER_SIZE         1500
-#define ZBUFFER_SIZE        1500
+#define BUFFER_SIZE         2000
+#define ZBUFFER_SIZE        2000
 
 typedef struct {
     uint8_t  type;             // ICMP Type
@@ -347,6 +347,7 @@ int main(int argc, char **argv) {
                 }
                 break;
             case 'z':
+                printf("Use zlib compression\n");
                 zlib = 1;
                 break;
             case 'r':
@@ -484,11 +485,13 @@ int main(int argc, char **argv) {
                 // If client uses zlib or server knows that client uses zlib compress packet
                 if((zlib && mode == CLIENT) || (mode == SERVER && clients[inner_ip->daddr >> 24].uses_zlib)) {
                     uLongf zbuff_len = ZBUFFER_SIZE - sizeof(icmp_echo_t);
-                    if(compress2((Bytef *)(zbuffer + sizeof(icmp_echo_t)), &zbuff_len, (Bytef *)inner_ip, nread, Z_BEST_COMPRESSION) != Z_OK) {
+                    int zstatus = compress2((Bytef *)(zbuffer + sizeof(icmp_echo_t)), &zbuff_len, (Bytef *)inner_ip, nread, Z_BEST_COMPRESSION);
+                    if(zstatus != Z_OK) {
                         struct timeval te;
                         gettimeofday(&te, NULL);
                         struct tm tm = *localtime(&te.tv_sec);
-                        fprintf(stderr, "%i: %02i:%02i:%02i.%06lu could not compress packet\n", __LINE__, tm.tm_hour, tm.tm_min, tm.tm_sec, te.tv_usec);
+                        fprintf(stderr, "[%s] %i: %02i:%02i:%02i.%06lu could not compress packet. Error %d\n",
+                                mode == SERVER ? "SERVER" : "CLIENT", __LINE__, tm.tm_hour, tm.tm_min, tm.tm_sec, te.tv_usec, zstatus);
                         continue;
                     }
                     outer_icmp = (icmp_echo_t *)zbuffer;
@@ -570,13 +573,17 @@ int main(int argc, char **argv) {
                     if(*(uint16_t *)outer_icmp->data == ZLIB_SIGNATURE) {
                         uLongf zbuff_len = ZBUFFER_SIZE;
                         uLongf buff_len = nread - (outer_ip->ihl << 2) - sizeof(icmp_echo_t);
-                        if(uncompress2((Bytef *)zbuffer, &zbuff_len, (Bytef *)&outer_icmp->data, &buff_len) != Z_OK) {
+
+                        int zstatus = uncompress2((Bytef *)zbuffer, &zbuff_len, (Bytef *)&outer_icmp->data, &buff_len);
+                        if(zstatus != Z_OK) {
                             struct timeval te;
                             gettimeofday(&te, NULL);
                             struct tm tm = *localtime(&te.tv_sec);
-                            fprintf(stderr, "%i: %02i:%02i:%02i.%06lu could not uncompress packet\n", __LINE__, tm.tm_hour, tm.tm_min, tm.tm_sec, te.tv_usec);
+                            fprintf(stderr, "[%s] %i: %02i:%02i:%02i.%06lu could not uncompress packet. Error %d\n",
+                                    mode == SERVER ? "SERVER" : "CLIENT", __LINE__, tm.tm_hour, tm.tm_min, tm.tm_sec, te.tv_usec, zstatus);
                             continue;
                         }
+                        nread = zbuff_len + (outer_ip->ihl << 2) + sizeof(icmp_echo_t);
                         out_buff = zbuffer;
                         inner_ip = (struct iphdr *)zbuffer;
                         uses_zlib = 1;

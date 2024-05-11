@@ -6,7 +6,7 @@ CFLAGS = -Wall
 LDFLAGS = -lz
 
 SERVER = example.com
-DEPLOY_PATH = /home/alex/$(PROJECT)
+DEPLOY_PATH = /home/user/$(PROJECT)
 
 default: $(PROJECT)
 
@@ -27,3 +27,7 @@ c: $(PROJECT)
 # Run server
 s: $(PROJECT)
 	sudo ./$(PROJECT) -sd -r -i eth0 -a 10.20.30.1
+
+# Run local test
+test: $(PROJECT)
+	sudo ./test.sh
