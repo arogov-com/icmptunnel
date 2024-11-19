@@ -1,6 +1,9 @@
+// Copyright (C) 2024 Aleksei Rogov <alekzzzr@gmail.com>. All rights reserved.
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
 #include <linux/if_tun.h>
 #include <sys/socket.h>
@@ -457,6 +460,12 @@ int main(int argc, char **argv) {
     int ret;
     fd_set rd_set;
     int nfds = (raw_sock_icmp > tun_fd ? raw_sock_icmp : tun_fd) + 1;
+
+    // pid_t fid = fork();
+    // if(fid == 0) {
+    //     printf("fork=%i, pid=%i\n", fid, getpid());
+    // }
+
     printf("Serving connections...\n");
     while(1) {
         FD_ZERO(&rd_set);
@@ -464,15 +473,7 @@ int main(int argc, char **argv) {
         FD_SET(raw_sock_icmp, &rd_set);
 
         ret = select(nfds, &rd_set, NULL, NULL, NULL);
-        if(ret == -1) {
-            perror("select() error\n");
-            continue;
-        }
-        else if(ret == 0) {
-            perror("select() timeout\n");
-            continue;
-        }
-        else {
+        if(ret > 0) {
             // Packet from the TUN interface
             if(FD_ISSET(tun_fd, &rd_set)) {
                 // Read a packet into the buffer with offset for an ICMP header
@@ -503,12 +504,12 @@ int main(int argc, char **argv) {
                 outer_icmp->crc = 0;
 
                 // Check packet, encapsulate, send to the server
-                if(mode == CLIENT) {
-                    // Cut out multicast and stray packets
-                    if((inner_ip->daddr & 0xf0) == 0xe0 || inner_ip->saddr != tunaddrn) {
-                        continue;
-                    }
+                struct sockaddr_in dst;
+                dst.sin_family = AF_INET;
+                dst.sin_port = 0;
 
+                // If mode is client and packet is not multicast and inner address is tunnel interface address
+                if(mode == CLIENT && (inner_ip->daddr & 0xf0) != 0xe0 && inner_ip->saddr == tunaddrn) {
                     // Encapsulate packet into ICMP and send it to the server
                     if(inner_ip->protocol == IPPROTO_UDP || inner_ip->protocol == IPPROTO_TCP || inner_ip->protocol == IPPROTO_ICMP ) {
                         // Make outer ICMP echo header
@@ -517,19 +518,9 @@ int main(int argc, char **argv) {
                         outer_icmp->seq = ntohs(sequence++);
                         outer_icmp->crc = checksum(out_buffer, nread + sizeof(icmp_echo_t), 0);
 
-                        struct sockaddr_in dst;
-                        dst.sin_family = AF_INET;
-                        dst.sin_port = 0;
                         dst.sin_addr.s_addr = server_ipn;
 
-                        update_counters(inner_ip->protocol, DIRECTION_SEND, nread + sizeof(icmp_echo_t));
                         debud_log(__LINE__, 2, inner_ip, nread, tundev, server_ipn, pid, sequence);
-
-                        // Send encapsulated packet to the server
-                        int ret = sendto(raw_sock_icmp, out_buffer, nread + sizeof(icmp_echo_t), 0, (const struct sockaddr *)&dst, sizeof(dst));
-                        if(ret < 0) {
-                            perror("client sendto error\n");
-                        }
                     }
                 }
                 // Encapsulate the packet into ICMP, send back to the client
@@ -541,21 +532,16 @@ int main(int argc, char **argv) {
                         outer_icmp->seq = clients[inner_ip->daddr >> 24].seq;
                         outer_icmp->crc = checksum(out_buffer, nread + sizeof(icmp_echo_t), 0);
 
-                        struct sockaddr_in dst;
-                        dst.sin_family = AF_INET;
-                        dst.sin_port = 0;
                         dst.sin_addr.s_addr = clients[inner_ip->daddr >> 24].client_ip;
 
-                        update_counters(inner_ip->protocol, DIRECTION_SEND, nread + sizeof(icmp_echo_t));
                         debud_log(__LINE__, 3, inner_ip, nread, tundev, dst.sin_addr.s_addr, 0, 0);
-
-                        int ret = sendto(raw_sock_icmp, out_buffer, nread + sizeof(icmp_echo_t), 0, (const struct sockaddr *)&dst, sizeof(dst));
-                        if(ret < 0) {
-                            perror("server sendto error\n");
-                        }
                     }
                 }
-
+                update_counters(inner_ip->protocol, DIRECTION_SEND, nread + sizeof(icmp_echo_t));
+                int ret = sendto(raw_sock_icmp, out_buffer, nread + sizeof(icmp_echo_t), 0, (const struct sockaddr *)&dst, sizeof(dst));
+                if(ret < 0) {
+                    perror("server sendto error\n");
+                }
             }
             // ICMP packet from Internet
             if(FD_ISSET(raw_sock_icmp, &rd_set)) {
@@ -623,6 +609,7 @@ int main(int argc, char **argv) {
                             }
                         }
                     }
+
                     // Receive ICMP echo reply on the client side, decapsulate, write to tun interface
                     else if(outer_icmp->type == ICMP_ECHOREPLY && mode == CLIENT) {
                         if(inner_ip->version == 4 && (inner_ip->protocol == IPPROTO_ICMP || inner_ip->protocol == IPPROTO_UDP || inner_ip->protocol == IPPROTO_TCP)) {
@@ -634,6 +621,14 @@ int main(int argc, char **argv) {
                     }
                 }
             }
+        }
+        else if(ret == -1) {
+            perror("select() error\n");
+            continue;
+        }
+        else if(ret == 0) {
+            perror("select() timeout\n");
+            continue;
         }
     }
 

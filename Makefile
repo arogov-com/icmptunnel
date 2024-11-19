@@ -1,3 +1,5 @@
+# Copyright (C) 2024 Aleksei Rogov <alekzzzr@gmail.com>. All rights reserved.
+
 PROJECT = icmptunnel
 SOURCE = icmptunnel.c
 
